@@ -1,7 +1,7 @@
 #ifdef USE_OPENCV
 #include <opencv2/core/core.hpp>
 //#include <opencv2/opencv.hpp>
-#include <opencv2/contrib/contrib.hpp>
+//#include <opencv2/contrib/contrib.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #endif  // USE_OPENCV
 

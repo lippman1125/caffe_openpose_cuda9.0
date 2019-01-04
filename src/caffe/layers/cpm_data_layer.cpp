@@ -20,13 +20,36 @@ namespace caffe {
 template <typename Dtype>
 CPMDataLayer<Dtype>::CPMDataLayer(const LayerParameter& param)
   : BasePrefetchingDataLayer<Dtype>(param),
-    reader_(param),
+    offset_(),
     cpm_transform_param_(param.cpm_transform_param()){
+  db_.reset(db::GetDB(param.data_param().backend()));
+  db_->Open(param.data_param().source(), db::READ);
+  cursor_.reset(db_->NewCursor());
 }
 
 template <typename Dtype>
 CPMDataLayer<Dtype>::~CPMDataLayer() {
   this->StopInternalThread();
+}
+
+template <typename Dtype>
+bool CPMDataLayer<Dtype>::Skip() {
+  int size = Caffe::solver_count();
+  int rank = Caffe::solver_rank();
+  
+  bool keep = ((offset_ % size) == rank || this->layer_param_.phase() == TEST);
+  
+  return keep;
+}
+
+template <typename Dtype> 
+void CPMDataLayer<Dtype>::Next() {
+  cursor_->Next();
+  if (!cursor_->valid()) {
+    LOG_IF(INFO, Caffe::root_solver())<< "Restaring data prefetching from start.";
+    cursor_->SeekToFirst();
+  }
+  offset_++;
 }
 
 template <typename Dtype>
@@ -36,9 +59,10 @@ void CPMDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
      new CPMDataTransformer<Dtype>(cpm_transform_param_, this->phase_));
   cpm_data_transformer_->InitRand();
 
- 
+  Datum datum;
   // Read a data point, and use it to initialize the top blob.
-  Datum& datum = *(reader_.full().peek());
+  // Datum& datum = *(reader_.full().peek());
+  datum.ParseFromString(cursor_->value());
   LOG(INFO) << datum.height() << " " << datum.width() << " " << datum.channels();
 
   bool force_color = this->layer_param_.data_param().force_encoded_color();
@@ -63,10 +87,10 @@ void CPMDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
       this->layer_param_.cpm_transform_param().crop_size_y();
     const int width = this->phase_ != TRAIN ? datum.width() :
       this->layer_param_.cpm_transform_param().crop_size_x();
-    LOG(INFO) << "PREFETCH_COUNT is " << this->PREFETCH_COUNT;
+    LOG(INFO) << "PREFETCH_COUNT is " << this->prefetch_.size();
     top[0]->Reshape(batch_size, datum.channels(), height, width);
-    for (int i = 0; i < this->PREFETCH_COUNT; ++i) {
-      this->prefetch_[i].data_.Reshape(batch_size, datum.channels(), height, width);
+    for (int i = 0; i < this->prefetch_.size(); ++i) {
+      this->prefetch_[i]->data_.Reshape(batch_size, datum.channels(), height, width);
     }
     //this->transformed_data_.Reshape(1, 4, height, width);
     this->transformed_data_.Reshape(1, datum.channels(), height, width);
@@ -85,8 +109,8 @@ void CPMDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
 
     int num_parts = this->layer_param_.cpm_transform_param().num_parts();
     top[1]->Reshape(batch_size, 2*(num_parts+1), height/stride, width/stride);
-    for (int i = 0; i < this->PREFETCH_COUNT; ++i) {
-      this->prefetch_[i].label_.Reshape(batch_size, 2*(num_parts+1), height/stride, width/stride);
+    for (int i = 0; i < this->prefetch_.size(); ++i) {
+      this->prefetch_[i]->label_.Reshape(batch_size, 2*(num_parts+1), height/stride, width/stride);
     }
     this->transformed_label_.Reshape(1, 2*(num_parts+1), height/stride, width/stride);
   }
@@ -105,13 +129,19 @@ void CPMDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
   CPUTimer timer;
   CHECK(batch->data_.count());
   CHECK(this->transformed_data_.count());
+  
+  while(Skip()) {
+    Next();
+  }
 
+  Datum datum;
   // Reshape on single input batches for inputs of varying dimension.
   const int batch_size = this->layer_param_.data_param().batch_size();
   const int crop_size = this->layer_param_.cpm_transform_param().crop_size();
   bool force_color = this->layer_param_.data_param().force_encoded_color();
   if (batch_size == 1 && crop_size == 0) {
-    Datum& datum = *(reader_.full().peek());
+    //Datum& datum = *(reader_.full().peek());
+    datum.ParseFromString(cursor_->value());
     if (datum.encoded()) {
       if (force_color) {
         DecodeDatum(&datum, true);
@@ -134,7 +164,8 @@ void CPMDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
   for (int item_id = 0; item_id < batch_size; ++item_id) {
     // get a blob
     timer.Start();
-    Datum& datum = *(reader_.full().pop("Waiting for data"));
+    //Datum& datum = *(reader_.full().pop("Waiting for data"));
+    datum.ParseFromString(cursor_->value());
     deque_time += timer.MicroSeconds();
 
     timer.Start();
@@ -173,7 +204,8 @@ void CPMDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
     // }
     trans_time += timer.MicroSeconds();
 
-    reader_.free().push(const_cast<Datum*>(&datum));
+    //reader_.free().push(const_cast<Datum*>(&datum));
+    Next();
   }
   batch_timer.Stop();
 
